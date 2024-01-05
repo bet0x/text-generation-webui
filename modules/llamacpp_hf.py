@@ -9,39 +9,32 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from modules import RoPE, shared
 from modules.logging_colors import logger
-from modules.utils import is_gguf
-
-import llama_cpp
 
 try:
-    import llama_cpp_ggml
+    import llama_cpp
 except:
-    llama_cpp_ggml = llama_cpp
+    llama_cpp = None
 
-if torch.cuda.is_available() and not torch.version.hip:
-    try:
-        import llama_cpp_cuda
-    except:
-        llama_cpp_cuda = None
-    try:
-        import llama_cpp_ggml_cuda
-    except:
-        llama_cpp_ggml_cuda = llama_cpp_cuda
-else:
+try:
+    import llama_cpp_cuda
+except:
     llama_cpp_cuda = None
-    llama_cpp_ggml_cuda = None
+
+try:
+    import llama_cpp_cuda_tensorcores
+except:
+    llama_cpp_cuda_tensorcores = None
 
 
-def llama_cpp_lib(model_file: Union[str, Path] = None):
-    if model_file is not None:
-        gguf_model = is_gguf(model_file)
+def llama_cpp_lib():
+    if shared.args.cpu and llama_cpp is not None:
+        return llama_cpp
+    elif shared.args.tensorcores and llama_cpp_cuda_tensorcores is not None:
+        return llama_cpp_cuda_tensorcores
+    elif llama_cpp_cuda is not None:
+        return llama_cpp_cuda
     else:
-        gguf_model = True
-
-    if shared.args.cpu or llama_cpp_cuda is None:
-        return llama_cpp if gguf_model else llama_cpp_ggml
-    else:
-        return llama_cpp_cuda if gguf_model else llama_cpp_ggml_cuda
+        return llama_cpp
 
 
 class LlamacppHF(PreTrainedModel):
@@ -55,7 +48,7 @@ class LlamacppHF(PreTrainedModel):
             'n_tokens': self.model.n_tokens,
             'input_ids': self.model.input_ids,
             'scores': self.model.scores,
-            'ctx': self.model.ctx
+            'ctx': self.model._ctx
         }
 
         if shared.args.cfg_cache:
@@ -64,7 +57,7 @@ class LlamacppHF(PreTrainedModel):
                 'n_tokens': self.model.n_tokens,
                 'input_ids': self.model.input_ids.copy(),
                 'scores': self.model.scores.copy(),
-                'ctx': llama_cpp_lib(path).llama_new_context_with_model(model.model, model.params)
+                'ctx': llama_cpp_lib().llama_new_context_with_model(model.model, model.context_params)
             }
 
     def _validate_model_class(self):
@@ -81,7 +74,7 @@ class LlamacppHF(PreTrainedModel):
             'n_tokens': self.model.n_tokens,
             'input_ids': self.model.input_ids,
             'scores': self.model.scores,
-            'ctx': self.model.ctx
+            'ctx': self.model._ctx
         })
 
     def save_negative_cache(self):
@@ -89,20 +82,20 @@ class LlamacppHF(PreTrainedModel):
             'n_tokens': self.model.n_tokens,
             'input_ids': self.model.input_ids,
             'scores': self.model.scores,
-            'ctx': self.model.ctx
+            'ctx': self.model._ctx
         })
 
     def load_cache(self):
         self.model.n_tokens = self.llamacpp_cache['n_tokens']
         self.model.input_ids = self.llamacpp_cache['input_ids']
         self.model.scores = self.llamacpp_cache['scores']
-        self.model.ctx = self.llamacpp_cache['ctx']
+        self.model._ctx = self.llamacpp_cache['ctx']
 
     def load_negative_cache(self):
         self.model.n_tokens = self.llamacpp_cache_negative['n_tokens']
         self.model.input_ids = self.llamacpp_cache_negative['input_ids']
         self.model.scores = self.llamacpp_cache_negative['scores']
-        self.model.ctx = self.llamacpp_cache_negative['ctx']
+        self.model._ctx = self.llamacpp_cache_negative['ctx']
 
     @property
     def device(self) -> torch.device:
@@ -133,14 +126,28 @@ class LlamacppHF(PreTrainedModel):
             seq = past_key_values + seq
 
         seq_tensor = torch.tensor(seq)
+        reset = True
 
-        # Make the forward call
+        # Make the forward call. The prefix-match code has been adapted from
+        # https://github.com/abetlen/llama-cpp-python/commit/f4090a0bb2a2a25acfe28d31c82cc1aa273bedee
         if labels is None:
-            if past_seq is None or not torch.equal(past_seq, seq_tensor[:-1]):
+            if past_seq is not None:
+                min_length = min(past_seq.shape[0], seq_tensor.shape[0])
+                indices = torch.nonzero(~torch.eq(past_seq[:min_length], seq_tensor[:min_length]))
+                if len(indices) > 0:
+                    longest_prefix = indices[0].item()
+                else:
+                    longest_prefix = min_length
+
+                if longest_prefix > 0:
+                    reset = False
+                    self.model.n_tokens = longest_prefix
+                    if len(seq_tensor) - longest_prefix > 0:
+                        self.model.eval(seq[longest_prefix:])
+
+            if reset:
                 self.model.reset()
                 self.model.eval(seq)
-            else:
-                self.model.eval([seq[-1]])
 
             logits = torch.tensor(self.model.scores[self.model.n_tokens - 1, :]).view(1, 1, -1).to(input_ids.device)
         else:
@@ -174,6 +181,7 @@ class LlamacppHF(PreTrainedModel):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: Optional[Union[str, os.PathLike]], *model_args, **kwargs):
         assert len(model_args) == 0 and len(kwargs) == 0, "extra args is currently not supported"
+
         if isinstance(pretrained_model_name_or_path, str):
             pretrained_model_name_or_path = Path(pretrained_model_name_or_path)
 
@@ -181,7 +189,7 @@ class LlamacppHF(PreTrainedModel):
         if path.is_file():
             model_file = path
         else:
-            model_file = (list(path.glob('*.gguf*')) + list(path.glob('*ggml*.bin')))[0]
+            model_file = list(path.glob('*.gguf'))[0]
 
         logger.info(f"llama.cpp weights detected: {model_file}\n")
 
@@ -193,28 +201,22 @@ class LlamacppHF(PreTrainedModel):
         params = {
             'model_path': str(model_file),
             'n_ctx': shared.args.n_ctx,
-            'seed': int(shared.args.llama_cpp_seed),
             'n_threads': shared.args.threads or None,
+            'n_threads_batch': shared.args.threads_batch or None,
             'n_batch': shared.args.n_batch,
             'use_mmap': not shared.args.no_mmap,
             'use_mlock': shared.args.mlock,
-            'mul_mat_q': shared.args.mul_mat_q,
-            'low_vram': shared.args.low_vram,
+            'mul_mat_q': not shared.args.no_mul_mat_q,
+            'numa': shared.args.numa,
             'n_gpu_layers': shared.args.n_gpu_layers,
             'rope_freq_base': RoPE.get_rope_freq_base(shared.args.alpha_value, shared.args.rope_freq_base),
             'tensor_split': tensor_split_list,
             'rope_freq_scale': 1.0 / shared.args.compress_pos_emb,
-            'logits_all': True,
+            'logits_all': shared.args.logits_all,
+            'offload_kqv': not shared.args.no_offload_kqv
         }
 
-        if not is_gguf(model_file):
-            ggml_params = {
-                'n_gqa': shared.args.n_gqa or None,
-                'rms_norm_eps': shared.args.rms_norm_eps or None,
-            }
-            params = params | ggml_params
-
-        Llama = llama_cpp_lib(model_file).Llama
+        Llama = llama_cpp_lib().Llama
         model = Llama(**params)
 
         return LlamacppHF(model, model_file)

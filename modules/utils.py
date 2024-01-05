@@ -2,9 +2,8 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Union
 
-from modules import shared
+from modules import github, shared
 from modules.logging_colors import logger
 
 
@@ -22,16 +21,17 @@ def save_file(fname, contents):
         return
 
     root_folder = Path(__file__).resolve().parent.parent
-    abs_path = Path(fname).resolve()
-    rel_path = abs_path.relative_to(root_folder)
+    abs_path_str = os.path.abspath(fname)
+    rel_path_str = os.path.relpath(abs_path_str, root_folder)
+    rel_path = Path(rel_path_str)
     if rel_path.parts[0] == '..':
         logger.error(f'Invalid file path: {fname}')
         return
 
-    with open(abs_path, 'w', encoding='utf-8') as f:
+    with open(abs_path_str, 'w', encoding='utf-8') as f:
         f.write(contents)
 
-    logger.info(f'Saved {abs_path}.')
+    logger.info(f'Saved {abs_path_str}.')
 
 
 def delete_file(fname):
@@ -40,14 +40,15 @@ def delete_file(fname):
         return
 
     root_folder = Path(__file__).resolve().parent.parent
-    abs_path = Path(fname).resolve()
-    rel_path = abs_path.relative_to(root_folder)
+    abs_path_str = os.path.abspath(fname)
+    rel_path_str = os.path.relpath(abs_path_str, root_folder)
+    rel_path = Path(rel_path_str)
     if rel_path.parts[0] == '..':
         logger.error(f'Invalid file path: {fname}')
         return
 
-    if abs_path.exists():
-        abs_path.unlink()
+    if rel_path.exists():
+        rel_path.unlink()
         logger.info(f'Deleted {fname}.')
 
 
@@ -77,7 +78,7 @@ def get_available_models():
         if not item.name.endswith(('.txt', '-np', '.pt', '.json', '.yaml', '.py')) and 'llama-tokenizer' not in item.name:
             model_list.append(re.sub('.pth$', '', item.name))
 
-    return sorted(model_list, key=natural_keys)
+    return ['None'] + sorted(model_list, key=natural_keys)
 
 
 def get_available_presets():
@@ -95,7 +96,7 @@ def get_available_prompts():
 
 def get_available_characters():
     paths = (x for x in Path('characters').iterdir() if x.suffix in ('.json', '.yaml', '.yml'))
-    return ['None'] + sorted(set((k.stem for k in paths)), key=natural_keys)
+    return sorted(set((k.stem for k in paths)), key=natural_keys)
 
 
 def get_available_instruction_templates():
@@ -104,21 +105,23 @@ def get_available_instruction_templates():
     if os.path.exists(path):
         paths = (x for x in Path(path).iterdir() if x.suffix in ('.json', '.yaml', '.yml'))
 
-    return ['None'] + sorted(set((k.stem for k in paths)), key=natural_keys)
+    return ['Select template to load...'] + sorted(set((k.stem for k in paths)), key=natural_keys)
 
 
 def get_available_extensions():
-    return sorted(set(map(lambda x: x.parts[1], Path('extensions').glob('*/script.py'))), key=natural_keys)
+    extensions = sorted(set(map(lambda x: x.parts[1], Path('extensions').glob('*/script.py'))), key=natural_keys)
+    extensions = [v for v in extensions if v not in github.new_extensions]
+    return extensions
 
 
 def get_available_loras():
-    return sorted([item.name for item in list(Path(shared.args.lora_dir).glob('*')) if not item.name.endswith(('.txt', '-np', '.pt', '.json'))], key=natural_keys)
+    return ['None'] + sorted([item.name for item in list(Path(shared.args.lora_dir).glob('*')) if not item.name.endswith(('.txt', '-np', '.pt', '.json'))], key=natural_keys)
 
 
 def get_datasets(path: str, ext: str):
     # include subdirectories for raw txt files to allow training from a subdirectory of txt files
     if ext == "txt":
-        return ['None'] + sorted(set([k.stem for k in list(Path(path).glob('txt')) + list(Path(path).glob('*/')) if k.stem != 'put-trainer-datasets-here']), key=natural_keys)
+        return ['None'] + sorted(set([k.stem for k in list(Path(path).glob('*.txt')) + list(Path(path).glob('*/')) if k.stem != 'put-trainer-datasets-here']), key=natural_keys)
 
     return ['None'] + sorted(set([k.stem for k in Path(path).glob(f'*.{ext}') if k.stem != 'put-trainer-datasets-here']), key=natural_keys)
 
@@ -127,13 +130,5 @@ def get_available_chat_styles():
     return sorted(set(('-'.join(k.stem.split('-')[1:]) for k in Path('css').glob('chat_style*.css'))), key=natural_keys)
 
 
-def is_gguf(path: Union[str, Path]) -> bool:
-    '''
-    Determines if a llama.cpp model is in GGUF format
-    Copied from ctransformers utils.py
-    '''
-    path = str(Path(path).resolve())
-    with open(path, "rb") as f:
-        magic = f.read(4)
-
-    return magic == "GGUF".encode()
+def get_available_grammars():
+    return ['None'] + sorted([item.name for item in list(Path('grammars').glob('*.gbnf'))], key=natural_keys)

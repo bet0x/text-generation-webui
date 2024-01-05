@@ -1,21 +1,32 @@
 import os
 import warnings
 
-from modules.logging_colors import logger
+from modules import shared
+
+import accelerate  # This early import makes Intel GPUs happy
+
+import modules.one_click_installer_check
 from modules.block_requests import OpenMonkeyPatch, RequestBlocker
+from modules.logging_colors import logger
 
 os.environ['GRADIO_ANALYTICS_ENABLED'] = 'False'
 os.environ['BITSANDBYTES_NOWELCOME'] = '1'
 warnings.filterwarnings('ignore', category=UserWarning, message='TypedStorage is deprecated')
+warnings.filterwarnings('ignore', category=UserWarning, message='Using the update method is deprecated')
+warnings.filterwarnings('ignore', category=UserWarning, message='Field "model_name" has conflict')
+warnings.filterwarnings('ignore', category=UserWarning, message='The value passed into gr.Dropdown()')
+warnings.filterwarnings('ignore', category=UserWarning, message='Field "model_names" has conflict')
 
 with RequestBlocker():
     import gradio as gr
 
 import matplotlib
+
 matplotlib.use('Agg')  # This fixes LaTeX rendering on some systems
 
 import json
 import os
+import signal
 import sys
 import time
 from functools import partial
@@ -27,7 +38,6 @@ import yaml
 import modules.extensions as extensions_module
 from modules import (
     chat,
-    shared,
     training,
     ui,
     ui_chat,
@@ -37,16 +47,26 @@ from modules import (
     ui_notebook,
     ui_parameters,
     ui_session,
-    utils,
+    utils
 )
 from modules.extensions import apply_extensions
 from modules.LoRA import add_lora_to_model
 from modules.models import load_model
 from modules.models_settings import (
-    get_model_settings_from_yamls,
+    get_fallback_settings,
+    get_model_metadata,
     update_model_parameters
 )
+from modules.shared import do_cmd_flags_warnings
 from modules.utils import gradio
+
+
+def signal_handler(sig, frame):
+    logger.info("Received Ctrl+C. Shutting down Text generation web UI gracefully.")
+    sys.exit(0)
+
+
+signal.signal(signal.SIGINT, signal_handler)
 
 
 def create_interface():
@@ -71,9 +91,10 @@ def create_interface():
         'loader': shared.args.loader or 'Transformers',
         'mode': shared.settings['mode'],
         'character_menu': shared.args.character or shared.settings['character'],
-        'instruction_template': shared.settings['instruction_template'],
+        'instruction_template_str': shared.settings['instruction_template_str'],
         'prompt_menu-default': shared.settings['prompt-default'],
         'prompt_menu-notebook': shared.settings['prompt-notebook'],
+        'filter_by_loader': shared.args.loader or 'All'
     })
 
     if Path("cache/pfp_character.png").exists():
@@ -153,6 +174,9 @@ def create_interface():
 
 if __name__ == "__main__":
 
+    logger.info("Starting Text generation web UI")
+    do_cmd_flags_warnings()
+
     # Load custom settings
     settings_file = None
     if shared.args.settings is not None and Path(shared.args.settings).exists():
@@ -163,26 +187,13 @@ if __name__ == "__main__":
         settings_file = Path('settings.json')
 
     if settings_file is not None:
-        logger.info(f"Loading settings from {settings_file}...")
+        logger.info(f"Loading settings from {settings_file}")
         file_contents = open(settings_file, 'r', encoding='utf-8').read()
         new_settings = json.loads(file_contents) if settings_file.suffix == "json" else yaml.safe_load(file_contents)
         shared.settings.update(new_settings)
 
     # Fallback settings for models
-    shared.model_config['.*'] = {
-        'wbits': 'None',
-        'model_type': 'None',
-        'groupsize': 'None',
-        'pre_layer': 0,
-        'mode': shared.settings['mode'],
-        'skip_special_tokens': shared.settings['skip_special_tokens'],
-        'custom_stopping_strings': shared.settings['custom_stopping_strings'],
-        'truncation_length': shared.settings['truncation_length'],
-        'n_gqa': 0,
-        'rms_norm_eps': 0,
-        'rope_freq_base': 0,
-    }
-
+    shared.model_config['.*'] = get_fallback_settings()
     shared.model_config.move_to_end('.*', last=False)  # Move to the beginning
 
     # Activate the extensions listed on settings.yaml
@@ -216,24 +227,36 @@ if __name__ == "__main__":
 
     # If any model has been selected, load it
     if shared.model_name != 'None':
-        model_settings = get_model_settings_from_yamls(shared.model_name)
-        shared.settings.update(model_settings)  # hijacking the interface defaults
-        update_model_parameters(model_settings, initial=True)  # hijacking the command-line arguments
+        p = Path(shared.model_name)
+        if p.exists():
+            model_name = p.parts[-1]
+            shared.model_name = model_name
+        else:
+            model_name = shared.model_name
+
+        model_settings = get_model_metadata(model_name)
+        update_model_parameters(model_settings, initial=True)  # hijack the command-line arguments
 
         # Load the model
-        shared.model, shared.tokenizer = load_model(shared.model_name)
+        shared.model, shared.tokenizer = load_model(model_name)
         if shared.args.lora:
             add_lora_to_model(shared.args.lora)
 
     shared.generation_lock = Lock()
 
-    # Launch the web UI
-    create_interface()
-    while True:
-        time.sleep(0.5)
-        if shared.need_restart:
-            shared.need_restart = False
+    if shared.args.nowebui:
+        # Start the API in standalone mode
+        shared.args.extensions = [x for x in shared.args.extensions if x != 'gallery']
+        if shared.args.extensions is not None and len(shared.args.extensions) > 0:
+            extensions_module.load_extensions()
+    else:
+        # Launch the web UI
+        create_interface()
+        while True:
             time.sleep(0.5)
-            shared.gradio['interface'].close()
-            time.sleep(0.5)
-            create_interface()
+            if shared.need_restart:
+                shared.need_restart = False
+                time.sleep(0.5)
+                shared.gradio['interface'].close()
+                time.sleep(0.5)
+                create_interface()
